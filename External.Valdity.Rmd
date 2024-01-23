@@ -1,0 +1,754 @@
+---
+title: "OCPD.External.Validity.Analyses"
+author: "Allison Moreau"
+date: '2022-04-29'
+output: html_document
+---
+
+Doug Samuel (Purdue University) provided a dataset to use for external validation of OCPD models. 
+This is from the original 2012 FFOCI paper. It has NEO-PI-R and FFOCI data and is thus being 
+used to externally validate the OCPD (i.e., FFOCI predictive) model trained in SPAN data.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = '~/Library/CloudStorage/Box-Box/research/projects/dissertation/')
+
+library(haven)
+library(schoolmath) # contains is.decimal function
+library(readxl)
+library(caret)
+library(tidyverse)
+
+results.dir <- "./Results/Aim1.OCPD/ML/OCPD.NAs.filtered.models/from.caretList/parallel/seed.GIVEN/all.unresid.models.run/NEW.all.rerun.fixed.FU12MAPP/"
+```
+
+# Load Data #
+```{r load.data}
+# Dataset from original 2012 FFOCI Paper 
+Doug.2012paper.data <- read_spss("./Data/FFOCI.datasets.from.Doug/2012_FFOCI_Paper/Initial.Study-Validation.Half.sav")
+
+# Add made-up ID variable to keep track of rows/data 
+# (the data was deidentified and didn't have original study ID)
+Doug.2012paper.data$Fake.ID <- seq(from = 1, to = 203, by = 1)
+```
+
+# Check data and compare to publication #
+```{r check.data}
+## Demographics - listed in publication for full sample. data is only for validation half
+## so can't compare to publication but included for information purposes
+mean(Doug.2012paper.data$Age, na.rm = TRUE)
+sd(Doug.2012paper.data$Age, na.rm = TRUE)
+table(Doug.2012paper.data$Age, useNA = "always")
+table(Doug.2012paper.data$Gender, useNA = "always")
+table(Doug.2012paper.data$Ethnicity, useNA = "always")
+table(Doug.2012paper.data$Hispanic, useNA = "always")
+
+## WISPI OCPD Scale mean item score
+### Check for missing data
+apply(Doug.2012paper.data[ ,723:742], 2, function(x) table(is.na(x)))
+# Results: none. all look imputed
+mean(rowMeans(Doug.2012paper.data[ ,723:742], na.rm = TRUE))
+# mean = 4.39; sd = 1.497 (same as publication)
+
+## SNAP-2 OCPD scale mean T score 
+mean(Doug.2012paper.data$Snap_OCPD_t)
+sd(Doug.2012paper.data$Snap_OCPD_t)
+# MEAN = 52.4; SD = 12.4 (same as publication)
+
+## DAPP-BQ Compulsivity Scale
+mean(Doug.2012paper.data$DAPPcompulsivity)
+sd(Doug.2012paper.data$DAPPcompulsivity)
+# Mean = 52.66; SD = 12.05 (basically same as publication. depends on SD rounding)
+
+## FFOCI Scale Means + SDs
+apply(Doug.2012paper.data[ , c(paste0(rep("ffoci", 12), c("c1", "c2", "c3", "c4", "c5", "c6",
+                                                         "e1", "e5", "n1", "o3", "o4", "o6")))],
+      2, describe)
+# 9/12 scales slightly different values for dataset vs. publications 
+
+## FFOCI Scales Intercorrelations
+round(cor(Doug.2012paper.data[ , c(paste0(rep("ffoci", 12), c("c1", "c2", "c3", "c4", "c5", "c6",
+                                                          "e1", "e5", "n1", "o3", "o4", "o6")))]), 2)
+# same as publication
+```
+
+# Remove subjs missing for resid
+Residualized models controlled for age and gender. Remove subjects missing 
+age or gender data so the same sample being compared for residualized and unresidualized models
+```{r}
+# Create new dataframe for data manipulations/rescoring (keeping original df for reference)
+Doug.2012paper.data.rescored <- filter(Doug.2012paper.data, 
+                                       !is.na(Gender) & !is.na(Age))
+```
+
+# Pre-process FFOCI Data #
+Note: on 5/2/22 ALM manually confirmed that reversed items on FFOCI were 
+already reverse scored in input data
+```{r preprocess.FFOCI}
+# Create new dataframes for rescored data
+## Option 1: Keeping Doug's imputation
+# Doug.2012paper.data.rescored <- Doug.2012paper.data
+## Option 2: Using SPAN's processing/imputation
+# Doug.2012paper.data.rescored2 <- Doug.2012paper.data
+
+## Rescale FFOCI data so items scored 0-4 ##
+# DOUG'S GROUP SCORES ITEMS ON 1-5 SCALE. THE TOTAL FFOCI-SF SCORE BEING USED FOR THE 
+# ML MODELS TRAINED IN SPAN DATA ORIGINATES FROM O-4 SCORING
+# some values are imputed so need to subtract 1 instead of specifying new values. 
+# otherwise imputed values (which are often decimal places) won't get converted
+
+### Raw data (pool vars are FFOCI pool item cols)
+Doug.2012paper.data.rescored[ , grep("pool", colnames(Doug.2012paper.data.rescored))] <- 
+    Doug.2012paper.data.rescored[ , grep("pool", colnames(Doug.2012paper.data.rescored))] - 1 
+#Doug.2012paper.data.rescored2[ , grep("pool", colnames(Doug.2012paper.data.rescored2))] <- 
+#    Doug.2012paper.data.rescored2[ , grep("pool", colnames(Doug.2012paper.data.rescored2))] - 1 
+
+### Scale totals
+# not bothering to rescore these b/c they're for the full-length FFOCI which I'm not using
+# and it would take a lot of work to map the pool items to FFOCI Qs and code up the scales
+# GOING TO REMOVE THESE FROM RESCORED DATAFRAME SO DON'T ACCIDENTALLY USE THEM.
+Doug.2012paper.data.rescored <- Doug.2012paper.data.rescored[ , -grep("ffoci",  
+                                                                colnames(Doug.2012paper.data.rescored))]
+#Doug.2012paper.data.rescored2 <- Doug.2012paper.data.rescored2[ , -grep("ffoci", 
+#                                                                colnames(Doug.2012paper.data.rescored2))]
+
+## Determine items in FFOCI-SF ##
+### Load FFOCI key ###
+FFOCI.key <- read_xlsx("./Data/FFOCI.datasets.from.Doug/2012_FFOCI_Paper/All.OCPD.item.pools_with.final.numbers.xlsx",
+                       range = "A2:G299", col_names = c("Category", "CategoryNum", "OrderNuminCategory", "SurveyMonkeyNum", "Item", "FFOCINum", "FFOCISFNum"))
+### Create key for FFOCI-SF items ###
+FFOCISF.key <- filter(FFOCI.key, !is.na(FFOCISFNum)) %>% select(SurveyMonkeyNum, FFOCISFNum) %>% 
+    mutate(pool.item = paste0("pool", SurveyMonkeyNum))
+### Select pool item columns that are FFOCI-SF items ###  
+FFOCISF.data <- subset(Doug.2012paper.data.rescored, select = FFOCISF.key$pool.item)
+
+### Rename cols to FFOCI-SF item # using key ###
+names(FFOCISF.data) <- plyr::mapvalues(names(FFOCISF.data), from = FFOCISF.key$pool.item, 
+                                       to = FFOCISF.key$FFOCISFNum) 
+names(FFOCISF.data) <-  paste0("FFOCISF.", names(FFOCISF.data))
+
+## Add FFOCI-SF columns (from FFOCISF.data) to main dataframe (Doug.2012paper.data.rescored) ##
+## NOTE: technically duplicates data, but didn't want to mess w/ orig. pool# variables and only rename the FFOCI-SF ones
+Doug.2012paper.data.rescored <- bind_cols(Doug.2012paper.data.rescored, FFOCISF.data)
+
+## Determine which FFOCI pool items have scores outside of possible range (from imputation) ##
+# originally this would be values <1 and >5. since rescaled to 0-4, now values <0 and >4
+table(apply(select(Doug.2012paper.data.rescored, contains("pool")), 2, min)) # possible FFOCI items were labeled pool#
+table(apply(select(Doug.2012paper.data.rescored, contains("pool")), 2, max))
+## FFOCI-SF - Q15 + Q7 have values > 4, 
+##    Q27, Q20, Q13, Q5, Q38, 29, 30, 22, 47, 34 have values < 0
+
+# Create new dataframe for rescored data option #2 before do option #1 processing
+Doug.2012paper.data.rescored2 <- Doug.2012paper.data.rescored
+
+### OPTION 1: Replace those values that are outside of possible range w/ 4 and 0
+#             + calculate FFOCI-SF Total score
+Doug.2012paper.data.rescored <- Doug.2012paper.data.rescored %>% 
+     mutate(across(contains(c("pool", "FFOCISF.")), # selects the FFOCI pool items + FFOCISF items
+                   ~case_when(. > 4 ~ 4, # if greater than 4, replace w/ 4
+                              . < 0 ~ 0, # if less than 0, replace w/ 0
+                              TRUE ~ .))) %>% # this says to keep current val if not >4 or <0
+     mutate(FFOCISF_Total = rowSums(select(., starts_with("FFOCISF"))))
+
+### OPTION 2: Remove all the imputed scores and use approach from SPAN 
+# Change imputed values (i.e., non-integers) to NA 
+Doug.2012paper.data.rescored2 <- Doug.2012paper.data.rescored2 %>%
+    mutate_at(.vars = vars(contains(c("pool", "FFOCISF."))), 
+              .funs = funs(ifelse(is.decimal(.), NA, .)))
+
+# Create function that processes FFOCI data like SPAN does
+FFOCI.SPAN.processing <- function(df){
+    df <- df %>% rowwise() %>%
+# Facets  (ALM manually confirmed this works correctly on 5/2/22)
+	mutate(
+	FFOCISF.N1 = sum(FFOCISF.1, FFOCISF.13, FFOCISF.25, FFOCISF.37, na.rm = TRUE),
+	FFOCISF.E1 = sum(FFOCISF.2, FFOCISF.14, FFOCISF.26, FFOCISF.38, na.rm = TRUE),
+	FFOCISF.E5 = sum(FFOCISF.3, FFOCISF.15, FFOCISF.27, FFOCISF.39, na.rm = TRUE),
+	FFOCISF.O3 = sum(FFOCISF.4, FFOCISF.16, FFOCISF.28, FFOCISF.40, na.rm = TRUE),
+	FFOCISF.O4 = sum(FFOCISF.5, FFOCISF.17, FFOCISF.29, FFOCISF.41, na.rm = TRUE),
+	FFOCISF.O6 = sum(FFOCISF.6, FFOCISF.18, FFOCISF.30, FFOCISF.42, na.rm = TRUE),
+	FFOCISF.C1 = sum(FFOCISF.7, FFOCISF.19, FFOCISF.31, FFOCISF.43, na.rm = TRUE),
+	FFOCISF.C2 = sum(FFOCISF.8, FFOCISF.20, FFOCISF.32, FFOCISF.44, na.rm = TRUE),
+	FFOCISF.C3 = sum(FFOCISF.9, FFOCISF.21, FFOCISF.33, FFOCISF.45, na.rm = TRUE),
+	FFOCISF.C4 = sum(FFOCISF.10, FFOCISF.22, FFOCISF.34, FFOCISF.46, na.rm = TRUE),
+	FFOCISF.C5 = sum(FFOCISF.11, FFOCISF.23, FFOCISF.35, FFOCISF.47, na.rm = TRUE),
+	FFOCISF.C6 = sum(FFOCISF.12, FFOCISF.24, FFOCISF.36, FFOCISF.48, na.rm = TRUE),
+# Domains (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N = FFOCISF.N1,
+	FFOCISF.E = sum(FFOCISF.E1, FFOCISF.E5, na.rm = TRUE),
+	FFOCISF.O = sum(FFOCISF.O3, FFOCISF.O4, FFOCISF.O6, na.rm = TRUE),
+	FFOCISF.C = sum(FFOCISF.C1, FFOCISF.C2, FFOCISF.C3, FFOCISF.C4, FFOCISF.C5, FFOCISF.C6, na.rm = TRUE),
+# Count missing values in case people want to do exclusions
+# Facets (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N_miss1 = sum(is.na(c(FFOCISF.1, FFOCISF.13, FFOCISF.25, FFOCISF.37))),
+	FFOCISF.E_miss1 = sum(is.na(c(FFOCISF.2, FFOCISF.14, FFOCISF.26, FFOCISF.38))),
+	FFOCISF.E_miss5 = sum(is.na(c(FFOCISF.3, FFOCISF.15, FFOCISF.27, FFOCISF.39))),
+	FFOCISF.O_miss3 = sum(is.na(c(FFOCISF.4, FFOCISF.16, FFOCISF.28, FFOCISF.40))),
+	FFOCISF.O_miss4 = sum(is.na(c(FFOCISF.5, FFOCISF.17, FFOCISF.29, FFOCISF.41))),
+	FFOCISF.O_miss6 = sum(is.na(c(FFOCISF.6, FFOCISF.18, FFOCISF.30, FFOCISF.42))),
+	FFOCISF.C_miss1 = sum(is.na(c(FFOCISF.7, FFOCISF.19, FFOCISF.31, FFOCISF.43))),
+	FFOCISF.C_miss2 = sum(is.na(c(FFOCISF.8, FFOCISF.20, FFOCISF.32, FFOCISF.44))),
+	FFOCISF.C_miss3 = sum(is.na(c(FFOCISF.9, FFOCISF.21, FFOCISF.33, FFOCISF.45))),
+	FFOCISF.C_miss4 = sum(is.na(c(FFOCISF.10, FFOCISF.22, FFOCISF.34, FFOCISF.46))),
+	FFOCISF.C_miss5 = sum(is.na(c(FFOCISF.11, FFOCISF.23, FFOCISF.35, FFOCISF.47))),
+	FFOCISF.C_miss6 = sum(is.na(c(FFOCISF.12, FFOCISF.24, FFOCISF.36, FFOCISF.48))),
+# Domains (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N_miss = FFOCISF.N_miss1,
+	FFOCISF.E_miss = sum(FFOCISF.E_miss1, FFOCISF.E_miss5),
+	FFOCISF.O_miss = sum(FFOCISF.O_miss3, FFOCISF.O_miss4, FFOCISF.O_miss6),
+	FFOCISF.C_miss = sum(FFOCISF.C_miss1, FFOCISF.C_miss2, FFOCISF.C_miss3, FFOCISF.C_miss4, FFOCISF.C_miss5, FFOCISF.C_miss6),
+
+# If the participant missed 1 of the questions in a facet scale, rescale their score
+# Rescaled scores are in variables ending "_scaled"
+# Facets (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N1_scaled = ifelse(FFOCISF.N_miss1 <= 1, FFOCISF.N1/(4-FFOCISF.N_miss1)*4, NA),
+	FFOCISF.E1_scaled = ifelse(FFOCISF.E_miss1 <= 1, FFOCISF.E1/(4-FFOCISF.E_miss1)*4, NA),
+	FFOCISF.E5_scaled = ifelse(FFOCISF.E_miss5 <= 1, FFOCISF.E5/(4-FFOCISF.E_miss5)*4, NA),
+	FFOCISF.O3_scaled = ifelse(FFOCISF.O_miss3 <= 1, FFOCISF.O3/(4-FFOCISF.O_miss3)*4, NA),
+	FFOCISF.O4_scaled = ifelse(FFOCISF.O_miss4 <= 1, FFOCISF.O4/(4-FFOCISF.O_miss4)*4, NA),
+	FFOCISF.O6_scaled = ifelse(FFOCISF.O_miss6 <= 1, FFOCISF.O6/(4-FFOCISF.O_miss6)*4, NA),
+	FFOCISF.C1_scaled = ifelse(FFOCISF.C_miss1 <= 1, FFOCISF.C1/(4-FFOCISF.C_miss1)*4, NA),
+	FFOCISF.C2_scaled = ifelse(FFOCISF.C_miss2 <= 1, FFOCISF.C2/(4-FFOCISF.C_miss2)*4, NA),
+	FFOCISF.C3_scaled = ifelse(FFOCISF.C_miss3 <= 1, FFOCISF.C3/(4-FFOCISF.C_miss3)*4, NA),
+	FFOCISF.C4_scaled = ifelse(FFOCISF.C_miss4 <= 1, FFOCISF.C4/(4-FFOCISF.C_miss4)*4, NA),
+	FFOCISF.C5_scaled = ifelse(FFOCISF.C_miss5 <= 1, FFOCISF.C5/(4-FFOCISF.C_miss5)*4, NA),
+	FFOCISF.C6_scaled = ifelse(FFOCISF.C_miss6 <= 1, FFOCISF.C6/(4-FFOCISF.C_miss6)*4, NA),
+# Domains (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N_scaled = ifelse(FFOCISF.N_miss <= 1, FFOCISF.N/(4-FFOCISF.N_miss)*4, NA),
+	FFOCISF.E_scaled = ifelse(FFOCISF.E_miss <= 2, FFOCISF.E/(8-FFOCISF.E_miss)*8, NA),
+	FFOCISF.O_scaled = ifelse(FFOCISF.O_miss <= 2, FFOCISF.O/(12-FFOCISF.O_miss)*12, NA),
+	FFOCISF.C_scaled = ifelse(FFOCISF.C_miss <= 2, FFOCISF.C/(24-FFOCISF.C_miss)*24, NA),
+
+# Original score - only includes complete questionnaires
+## Facets (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N1_nomiss = ifelse(FFOCISF.N_miss1 == 0, sum(FFOCISF.1, FFOCISF.13, FFOCISF.25, FFOCISF.37), NA),
+	FFOCISF.E1_nomiss = ifelse(FFOCISF.E_miss1 == 0, sum(FFOCISF.2, FFOCISF.14, FFOCISF.26, FFOCISF.38), NA),
+	FFOCISF.E5_nomiss = ifelse(FFOCISF.E_miss5 == 0, sum(FFOCISF.3, FFOCISF.15, FFOCISF.27, FFOCISF.39), NA),
+	FFOCISF.O3_nomiss = ifelse(FFOCISF.O_miss3 == 0, sum(FFOCISF.4, FFOCISF.16, FFOCISF.28, FFOCISF.40), NA),
+	FFOCISF.O4_nomiss = ifelse(FFOCISF.O_miss4 == 0, sum(FFOCISF.5, FFOCISF.17, FFOCISF.29, FFOCISF.41), NA),
+	FFOCISF.O6_nomiss = ifelse(FFOCISF.O_miss6 == 0, sum(FFOCISF.6, FFOCISF.18, FFOCISF.30, FFOCISF.42), NA),
+	FFOCISF.C1_nomiss = ifelse(FFOCISF.C_miss1 == 0, sum(FFOCISF.7, FFOCISF.19, FFOCISF.31, FFOCISF.43), NA),
+	FFOCISF.C2_nomiss = ifelse(FFOCISF.C_miss2 == 0, sum(FFOCISF.8, FFOCISF.20, FFOCISF.32, FFOCISF.44), NA),
+	FFOCISF.C3_nomiss = ifelse(FFOCISF.C_miss3 == 0, sum(FFOCISF.9, FFOCISF.21, FFOCISF.33, FFOCISF.45), NA),
+	FFOCISF.C4_nomiss = ifelse(FFOCISF.C_miss4 == 0, sum(FFOCISF.10, FFOCISF.22, FFOCISF.34, FFOCISF.46), NA),
+	FFOCISF.C5_nomiss = ifelse(FFOCISF.C_miss5 == 0, sum(FFOCISF.11, FFOCISF.23, FFOCISF.35, FFOCISF.47), NA),
+	FFOCISF.C6_nomiss = ifelse(FFOCISF.C_miss6 == 0, sum(FFOCISF.12, FFOCISF.24, FFOCISF.36, FFOCISF.48), NA),
+## Domains (ALM manually confirmed this works correctly on 5/2/22)
+	FFOCISF.N_nomiss = ifelse(FFOCISF.N_miss == 0, FFOCISF.N1, NA),
+	FFOCISF.E_nomiss = ifelse(FFOCISF.E_miss == 0, sum(FFOCISF.E1_nomiss, FFOCISF.E5_nomiss), NA),
+	FFOCISF.O_nomiss = ifelse(FFOCISF.O_miss == 0, sum(FFOCISF.O3_nomiss, FFOCISF.O4_nomiss, FFOCISF.O6_nomiss), NA),
+	FFOCISF.C_nomiss = ifelse(FFOCISF.C_miss == 0, sum(FFOCISF.C1_nomiss, FFOCISF.C2_nomiss, FFOCISF.C3_nomiss, FFOCISF.C4_nomiss, FFOCISF.C5_nomiss, FFOCISF.C6_nomiss), NA),
+
+# Calculate grand totals
+    FFOCISF_Total = sum(c(FFOCISF.N1, FFOCISF.E1, FFOCISF.E5,
+                            FFOCISF.O3, FFOCISF.O4, FFOCISF.O6,
+                            FFOCISF.C1, FFOCISF.C2, FFOCISF.C3,
+                            FFOCISF.C4, FFOCISF.C5, FFOCISF.C6)),
+    FFOCISF_Scaled.Total = sum(c(FFOCISF.N1_scaled, FFOCISF.E1_scaled, FFOCISF.E5_scaled,
+                                   FFOCISF.O3_scaled, FFOCISF.O4_scaled, FFOCISF.O6_scaled,
+                                   FFOCISF.C1_scaled, FFOCISF.C2_scaled, FFOCISF.C3_scaled,
+                                   FFOCISF.C4_scaled, FFOCISF.C5_scaled, FFOCISF.C6_scaled)),
+    FFOCISF_NoMiss.Total = sum(c(FFOCISF.N1_nomiss, FFOCISF.E1_nomiss, FFOCISF.E5_nomiss,
+                                   FFOCISF.O3_nomiss, FFOCISF.O4_nomiss, FFOCISF.O6_nomiss,
+                                   FFOCISF.C1_nomiss, FFOCISF.C2_nomiss, FFOCISF.C3_nomiss,
+                                   FFOCISF.C4_nomiss, FFOCISF.C5_nomiss, FFOCISF.C6_nomiss))) %>%
+  ungroup() # remove grouping by row
+}
+
+Doug.2012paper.data.rescored2 <- FFOCI.SPAN.processing(Doug.2012paper.data.rescored2)
+
+## Check FFOCI-SF Total Distribution to see if any data transformation needed
+hist(Doug.2012paper.data.rescored$FFOCISF_Total)
+hist(Doug.2012paper.data.rescored2$FFOCISF_Total)
+    
+```
+
+# Pre-process NEO Data #
+```{r preprocess.NEO}
+
+## Fix NEO data so named the same as SPAN (trained ML models need same var names for making predictions) ##
+# Doug's data lists NEO items as 1-240. SPAN lists as <factor letter><facet #><item #>
+rename.Dougs.NEO <- function(df){
+    # Neuroticism
+    names(df)[names(df) %in% paste0("neo", c(1, 31, 61, 91, 121, 151, 181, 211))] <- sprintf("NEON1%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(6, 36, 66, 96, 126, 156, 186, 216))] <- sprintf("NEON2%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(11, 41, 71, 101, 131, 161, 191, 221))] <- sprintf("NEON3%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(16, 46, 76, 106, 136, 166, 196, 226))] <- sprintf("NEON4%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(21, 51, 81, 111, 141, 171, 201, 231))] <- sprintf("NEON5%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(26, 56, 86, 116, 146, 176, 206, 236))] <- sprintf("NEON6%d", 1:8)
+    # Extraversion
+    names(df)[names(df) %in% paste0("neo", c(2, 32, 62, 92, 122, 152, 182, 212))] <- sprintf("NEOE1%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(7, 37, 67, 97, 127, 157, 187, 217))] <- sprintf("NEOE2%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(12, 42, 72, 102, 132, 162, 192, 222))] <- sprintf("NEOE3%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(17, 47, 77, 107, 137, 167, 197, 227))] <- sprintf("NEOE4%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(22, 52, 82, 112, 142, 172, 202, 232))] <- sprintf("NEOE5%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(27, 57, 87, 117, 147, 177, 207, 237))] <- sprintf("NEOE6%d", 1:8)
+    # Openness   
+    names(df)[names(df) %in% paste0("neo", c(3, 33, 63, 93, 123, 153, 183, 213))] <- sprintf("NEOO1%d", 1:8) 
+    names(df)[names(df) %in% paste0("neo", c(8, 38, 68, 98, 128, 158, 188, 218))] <- sprintf("NEOO2%d", 1:8) 
+    names(df)[names(df) %in% paste0("neo", c(13, 43, 73, 103, 133, 163, 193, 223))] <- sprintf("NEOO3%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(18, 48, 78, 108, 138, 168, 198, 228))] <- sprintf("NEOO4%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(23, 53, 83, 113, 143, 173, 203, 233))] <- sprintf("NEOO5%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(28, 58, 88, 118, 148, 178, 208, 238))] <- sprintf("NEOO6%d", 1:8)
+    # Agreeableness
+    names(df)[names(df) %in% paste0("neo", c(4, 34, 64, 94, 124, 154, 184, 214))] <- sprintf("NEOA1%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(9, 39, 69, 99, 129, 159, 189, 219))] <- sprintf("NEOA2%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(14, 44, 74, 104, 134, 164, 194, 224))] <- sprintf("NEOA3%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(19, 49, 79, 109, 139, 169, 199, 229))] <- sprintf("NEOA4%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(24, 54, 84, 114, 144, 174, 204, 234))] <- sprintf("NEOA5%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(29, 59, 89, 119, 149, 179, 209, 239))] <- sprintf("NEOA6%d", 1:8)
+    # Conscientiousness
+    names(df)[names(df) %in% paste0("neo", c(5, 35, 65, 95, 125, 155, 185, 215))] <- sprintf("NEOC1%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(10, 40, 70, 100, 130, 160, 190, 220))] <- sprintf("NEOC2%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(15, 45, 75, 105, 135, 165, 195, 225))] <- sprintf("NEOC3%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(20, 50, 80, 110, 140, 170, 200, 230))]  <- sprintf("NEOC4%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(25, 55, 85, 115, 145, 175, 205, 235))] <- sprintf("NEOC5%d", 1:8)
+    names(df)[names(df) %in% paste0("neo", c(30, 60, 90, 120, 150, 180, 210, 240))] <- sprintf("NEOC6%d", 1:8)
+    return(df)
+}
+Doug.2012paper.data.rescored <- rename.Dougs.NEO(Doug.2012paper.data.rescored)
+Doug.2012paper.data.rescored2 <- rename.Dougs.NEO(Doug.2012paper.data.rescored2)
+
+##  Check NEO scale + adjust as needed (SPAN used 0-4 scale) ##
+table(apply(select(Doug.2012paper.data.rescored, starts_with("NEO", ignore.case = FALSE)), 2, max))
+table(apply(select(Doug.2012paper.data.rescored, starts_with("NEO", ignore.case = FALSE)), 2, min))
+table(apply(select(Doug.2012paper.data.rescored2, starts_with("NEO", ignore.case = FALSE)), 2, max))
+table(apply(select(Doug.2012paper.data.rescored2, starts_with("NEO", ignore.case = FALSE)), 2, min))
+apply(select(Doug.2012paper.data, matches("^neo\\d\\d\\d$")), 2, table)
+
+###  Subtract one from each score so it's 0-4 scale instead of 1-5 ###
+### Raw data
+# for option 1 (keeping Doug's imputation but replacing impossible values w/ min or max)
+Doug.2012paper.data.rescored[ , grep("NEO", colnames(Doug.2012paper.data.rescored), ignore.case = FALSE)] <-
+     Doug.2012paper.data.rescored[ , grep("NEO", colnames(Doug.2012paper.data.rescored), ignore.case = FALSE)]  - 1
+# for option 2 (removing Doug's imputation and using SPAN's method)
+Doug.2012paper.data.rescored2[ , grep("NEO", colnames(Doug.2012paper.data.rescored2), ignore.case = FALSE)] <-
+    Doug.2012paper.data.rescored2[ , grep("NEO", colnames(Doug.2012paper.data.rescored2), ignore.case = FALSE)] - 1
+
+### Some imputed scores are outside range of possible values (i.e. >4 and <0; >5 and <1 before subtracting 1 above)
+
+### OPTION 1: Keep Doug's imputation and replace those values w/ 4 and 0 ###
+Doug.2012paper.data.rescored <- Doug.2012paper.data.rescored %>% 
+     mutate(across(starts_with("NEO", ignore.case = FALSE), # selects the NEO items (facet totals are in # lowercase, which don't want to change)
+                   ~case_when(. > 4 ~ 4, # if greater than 4, replace w/ 4
+                              . < 0 ~ 0, # if less than 0, replace w/ 0
+                              TRUE ~ .))) # this says to keep current val if not >4 or <0
+
+### OPTION 2: REMOVE ALL IMPUTED SCORES AND USE APPROACH FROM SPAN (facet mean imputation for NEO) ###
+# Change imputed values (i.e., non-integers) to NA 
+Doug.2012paper.data.rescored2 <- Doug.2012paper.data.rescored2 %>%
+    mutate_at(.vars = vars(matches("^NEO[A-Z]\\d\\d$")), .funs = funs(ifelse(is.decimal(.), NA, .)))
+
+# Check number of NEO Qs subjs are missing data for
+table(rowSums(is.na(select(Doug.2012paper.data.rescored2, matches("^NEO[A-Z]\\d\\d$")))))
+## Result: highest was 23, so none missing >25% of Qs (i.e., 60) and need to be removed
+
+# Calculate facet means
+calc.facet.means <- function(df) {
+    # Agreeableness
+    df[["NEOA1.mean"]] <- df %>% select(matches("NEOA1\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOA2.mean"]] <- df %>% select(matches("NEOA2\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOA3.mean"]] <- df %>% select(matches("NEOA3\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOA4.mean"]] <- df %>% select(matches("NEOA4\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOA5.mean"]] <- df %>% select(matches("NEOA5\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOA6.mean"]] <- df %>% select(matches("NEOA6\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    # Extraversion
+    df[["NEOE1.mean"]] <- df %>% select(matches("NEOE1\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOE2.mean"]] <- df %>% select(matches("NEOE2\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOE3.mean"]] <- df %>% select(matches("NEOE3\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOE4.mean"]] <- df %>% select(matches("NEOE4\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOE5.mean"]] <- df %>% select(matches("NEOE5\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOE6.mean"]] <- df %>% select(matches("NEOE6\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    # Conscientiousness
+    df[["NEOC1.mean"]] <- df %>% select(matches("NEOC1\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOC2.mean"]] <- df %>% select(matches("NEOC2\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOC3.mean"]] <- df %>% select(matches("NEOC3\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOC4.mean"]] <- df %>% select(matches("NEOC4\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOC5.mean"]] <- df %>% select(matches("NEOC5\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOC6.mean"]] <- df %>% select(matches("NEOC6\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    # Openness
+    df[["NEOO1.mean"]] <- df %>% select(matches("NEOO1\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOO2.mean"]] <- df %>% select(matches("NEOO2\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOO3.mean"]] <- df %>% select(matches("NEOO3\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOO4.mean"]] <- df %>% select(matches("NEOO4\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOO5.mean"]] <- df %>% select(matches("NEOO5\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEOO6.mean"]] <- df %>% select(matches("NEOO6\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    # Neuroticism
+    df[["NEON1.mean"]] <- df %>% select(matches("NEON1\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEON2.mean"]] <- df %>% select(matches("NEON2\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEON3.mean"]] <- df %>% select(matches("NEON3\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEON4.mean"]] <- df %>% select(matches("NEON4\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEON5.mean"]] <- df %>% select(matches("NEON5\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    df[["NEON6.mean"]] <- df %>% select(matches("NEON6\\d$")) %>% rowMeans(., na.rm = TRUE) %>% round(., 2)
+    return(df)
+}
+Doug.2012paper.data.rescored2 <- calc.facet.means(Doug.2012paper.data.rescored2)
+
+# Replace NAs with facet means
+impute.w.NEO.facet.means_Doug <- function(df){
+    df <- df %>%
+    mutate_at(.vars = vars(matches("NEOO1\\d$")), .funs = funs(ifelse(is.na(.), NEOO1.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOO2\\d$")), .funs = funs(ifelse(is.na(.), NEOO2.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOO3\\d$")), .funs = funs(ifelse(is.na(.), NEOO3.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOO4\\d$")), .funs = funs(ifelse(is.na(.), NEOO4.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOO5\\d$")), .funs = funs(ifelse(is.na(.), NEOO5.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOO6\\d$")), .funs = funs(ifelse(is.na(.), NEOO6.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOC1\\d$")), .funs = funs(ifelse(is.na(.), NEOC1.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOC2\\d$")), .funs = funs(ifelse(is.na(.), NEOC2.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOC3\\d$")), .funs = funs(ifelse(is.na(.), NEOC3.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOC4\\d$")), .funs = funs(ifelse(is.na(.), NEOC4.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOC5\\d$")), .funs = funs(ifelse(is.na(.), NEOC5.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOC6\\d$")), .funs = funs(ifelse(is.na(.), NEOC6.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOE1\\d$")), .funs = funs(ifelse(is.na(.), NEOE1.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOE2\\d$")), .funs = funs(ifelse(is.na(.), NEOE2.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOE3\\d$")), .funs = funs(ifelse(is.na(.), NEOE3.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOE4\\d$")), .funs = funs(ifelse(is.na(.), NEOE4.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOE5\\d$")), .funs = funs(ifelse(is.na(.), NEOE5.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOE6\\d$")), .funs = funs(ifelse(is.na(.), NEOE6.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOA1\\d$")), .funs = funs(ifelse(is.na(.), NEOA1.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEOA2\\d$")), .funs = funs(ifelse(is.na(.), NEOA2.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOA3\\d$")), .funs = funs(ifelse(is.na(.), NEOA3.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOA4\\d$")), .funs = funs(ifelse(is.na(.), NEOA4.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOA5\\d$")), .funs = funs(ifelse(is.na(.), NEOA5.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEOA6\\d$")), .funs = funs(ifelse(is.na(.), NEOA6.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEON1\\d$")), .funs = funs(ifelse(is.na(.), NEON1.mean, .))) %>%
+    mutate_at(.vars = vars(matches("NEON2\\d$")), .funs = funs(ifelse(is.na(.), NEON2.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEON3\\d$")), .funs = funs(ifelse(is.na(.), NEON3.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEON4\\d$")), .funs = funs(ifelse(is.na(.), NEON4.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEON5\\d$")), .funs = funs(ifelse(is.na(.), NEON5.mean, .))) %>% 
+    mutate_at(.vars = vars(matches("NEON6\\d$")), .funs = funs(ifelse(is.na(.), NEON6.mean, .)))
+    return(df)
+}
+Doug.2012paper.data.rescored2 <- impute.w.NEO.facet.means_Doug(Doug.2012paper.data.rescored2)
+    
+### Recalculate NEO facet totals using raw data scored from 0-4 (do for both options)
+# (ALM manually confirmed this works as intended on 5/14/22)
+calc.facet.totals <- function(df) {
+    # Agreeableness
+    df[["neoa1"]] <- df %>% select(matches("^NEOA1\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoa2"]] <- df %>% select(matches("^NEOA2\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoa3"]] <- df %>% select(matches("^NEOA3\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoa4"]] <- df %>% select(matches("^NEOA4\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoa5"]] <- df %>% select(matches("^NEOA5\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoa6"]] <- df %>% select(matches("^NEOA6\\d$")) %>% rowSums(., na.rm = TRUE)
+    df[["neoagree"]] <- df %>% select(matches("^neoa\\d$")) %>% rowSums(., na.rm = TRUE) #factor/domain total
+    # Extraversion
+    df[["neoe1"]] <- df %>% select(matches("^NEOE1\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoe2"]] <- df %>% select(matches("^NEOE2\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoe3"]] <- df %>% select(matches("^NEOE3\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoe4"]] <- df %>% select(matches("^NEOE4\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoe5"]] <- df %>% select(matches("^NEOE5\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoe6"]] <- df %>% select(matches("^NEOE6\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoextra"]] <- df %>% select(matches("^neoe\\d$")) %>% rowSums(., na.rm = TRUE) #factor/domain total
+    # Conscientiousness
+    df[["neoc1"]] <- df %>% select(matches("^NEOC1\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoc2"]] <- df %>% select(matches("^NEOC2\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoc3"]] <- df %>% select(matches("^NEOC3\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoc4"]] <- df %>% select(matches("^NEOC4\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoc5"]] <- df %>% select(matches("^NEOC5\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoc6"]] <- df %>% select(matches("^NEOC6\\d$")) %>% rowSums(., na.rm = TRUE)
+    df[["neoconsc"]] <- df %>% select(matches("^neoc\\d$")) %>% rowSums(., na.rm = TRUE) #factor/domain total
+    # Openness
+    df[["neoo1"]] <- df %>% select(matches("^NEOO1\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoo2"]] <- df %>% select(matches("^NEOO2\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoo3"]] <- df %>% select(matches("^NEOO3\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoo4"]] <- df %>% select(matches("^NEOO4\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoo5"]] <- df %>% select(matches("^NEOO5\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoo6"]] <- df %>% select(matches("^NEOO6\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neoopen"]] <- df %>% select(matches("^neoo\\d$")) %>% rowSums(., na.rm = TRUE) #factor/domain total
+    # Neuroticism
+    df[["neon1"]] <- df %>% select(matches("^NEON1\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neon2"]] <- df %>% select(matches("^NEON2\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neon3"]] <- df %>% select(matches("^NEON3\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neon4"]] <- df %>% select(matches("^NEON4\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neon5"]] <- df %>% select(matches("^NEON5\\d$")) %>% rowSums(., na.rm = TRUE) 
+    df[["neon6"]] <- df %>% select(matches("^NEON6\\d$")) %>% rowSums(., na.rm = TRUE)
+    df[["neoneur"]] <- df %>% select(matches("^neon\\d$")) %>% rowSums(., na.rm = TRUE) #factor/domain total
+    return(df)
+}
+Doug.2012paper.data.rescored <- calc.facet.totals(Doug.2012paper.data.rescored)
+Doug.2012paper.data.rescored2 <- calc.facet.totals(Doug.2012paper.data.rescored2)
+```
+
+# Residualize data
+Residualize data to test residualized model performance also
+```{r residualize}
+# Create factor variable for gender (needed in next step)
+## for option 1 (keeping Doug's imputation)
+Doug.2012paper.data.rescored$Gender.factor <- factor(Doug.2012paper.data.rescored$Gender, 
+                                                     levels = c(1,2), labels = c("Male", "Female"))
+## for option 2 (using SPAN's imputation)
+Doug.2012paper.data.rescored2$Gender.factor <- factor(Doug.2012paper.data.rescored2$Gender, 
+                                                     levels = c(1,2), labels = c("Male", "Female"))
+# Residualize data to account for gender and age
+residualize.predictors.Doug2012 <- function(df){
+  X <- df[c("Gender.factor", "Age")]  # covariates
+  Y <- select(df, matches(c("^NEO[A-Z]\\d\\d$", "FFOCISF_.*Total"))) # NEO items (regex for NEO<1 letter><2 digits>) + FFOCISF total scores 
+  list_models <- lapply(Y, function(Y) with(X, lm(Y ~ Gender.factor + Age, 
+                                            na.action = "na.exclude"))) # Run all models
+  list_resid <- lapply(list_models, resid) # List residuals from all models
+  df_resid <- do.call(cbind.data.frame, list_resid) # Put residuals in dataframe
+  colnames(df_resid) <- paste(colnames(df_resid), "res", sep = ".") # Add ".res" to variable names
+  df <- cbind(df, df_resid) # Add residualized variables to df
+  return(df) # Make function return the dataframe
+}
+Doug.2012paper.data.rescored <- residualize.predictors.Doug2012(Doug.2012paper.data.rescored)
+Doug.2012paper.data.rescored2 <- residualize.predictors.Doug2012(Doug.2012paper.data.rescored2)
+```
+
+# Load OCPD model
+Load the trained ML model from SPAN data that predicts FFOCI-SF scores from NEO data
+```{r load.trained.model}
+final.SPAN.model.NOT.res <- readRDS(paste0(results.dir, "FU12.FFOCI.adapt.glmnet.Rds"))
+final.SPAN.model.res <- readRDS(paste0(results.dir, "FU12.FFOCI.res.adapt.glmnet.Rds"))
+```
+
+# Evaluate trained model performance on Doug's data
+Apply trained OCPD ML model to predict FFOCI-SF Total score in this new dataset
+to evaluate the OCPD ML model's external validity
+
+```{r prep.for.predictions}
+# Change variable names to match trained model
+## Add PFU12 before variable names (was easier to do to all columns than NEO items specifically)
+colnames(Doug.2012paper.data.rescored) <- 
+  paste0("PFU12", colnames(Doug.2012paper.data.rescored))
+colnames(Doug.2012paper.data.rescored2) <- 
+  paste0("PFU12", colnames(Doug.2012paper.data.rescored2))
+## Fix FFOCI total variable name to match the variable name used in trained model 
+names(Doug.2012paper.data.rescored)[names(Doug.2012paper.data.rescored) == 'PFU12FFOCISF_Total'] <- 'FU12FFOCI_Scaled.Total'
+names(Doug.2012paper.data.rescored)[names(Doug.2012paper.data.rescored) == 'PFU12FFOCISF_Total.res'] <- 'FU12FFOCI_Scaled.Total.res'
+names(Doug.2012paper.data.rescored2)[names(Doug.2012paper.data.rescored2) == 'PFU12FFOCISF_Scaled.Total'] <- 'FU12FFOCI_Scaled.Total'
+names(Doug.2012paper.data.rescored2)[names(Doug.2012paper.data.rescored2) == 'PFU12FFOCISF_Scaled.Total.res'] <- 'FU12FFOCI_Scaled.Total.res'
+
+# Create dataframes for only subjs w/ FFOCI Scaled.Total score
+## FOR OPTION 2, 5 subjs don't have FFOCI Scaled.Total score b/c they were missing 
+## more data than SPAN imputes.
+## so create a df w/ only subjs who have actual FFOCI scaled total scores. 
+## this will only generate predictions for subjs that have a known value to compare against
+Doug.2012paper.data.rescored2_complete.FFOCI.scaled <- filter(Doug.2012paper.data.rescored2,
+                                                              !is.na(FU12FFOCI_Scaled.Total))
+
+## To ensure a fair comparison of results using Doug's imputation (option 1) vs SPAN's imputation (option 2),
+## also create a option 1 dataframe w/ only subjects included in dataframe above
+Doug.2012paper.data.rescored_complete.FFOCI.scaled <- filter(Doug.2012paper.data.rescored,
+                                                             PFU12Fake.ID %in% Doug.2012paper.data.rescored2_complete.FFOCI.scaled[["PFU12Fake.ID"]])
+```
+
+## UN-residualized model/data
+```{r predictions.UNresidualized}
+# Generate predictions
+## Option 1 (Doug's imputation)
+Doug.2012paper.predicted.FFOCISF.Total <- predict(final.SPAN.model.NOT.res, 
+                                                  Doug.2012paper.data.rescored_complete.FFOCI.scaled) %>%
+   as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored_complete.FFOCI.scaled$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Total", "FakeID"))
+## Option 2 (SPAN's imputation)    
+Doug.2012paper.rescored2.predicted.FFOCISF.Total <- predict(final.SPAN.model.NOT.res, 
+       Doug.2012paper.data.rescored2_complete.FFOCI.scaled) %>%
+  as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored2_complete.FFOCI.scaled$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Scaled.Total", "FakeID"))
+
+# Write predictions to file
+write.csv(Doug.2012paper.predicted.FFOCISF.Total, file = paste0(results.dir,  "Doug2012paper.predicted.FFOCI.Total_FU12glmnet.model.csv"),
+          row.names = FALSE)
+write.csv(Doug.2012paper.rescored2.predicted.FFOCISF.Total, file = paste0(results.dir, "Doug2012paper.rescored2.predicted.FFOCI.Scaled.Total_FU12glmnet.model.csv"),
+          row.names = FALSE)
+
+# Get error metrics for predictions
+## Option 1 (Doug's imputation) NOTE- this is called Scaled.Total, but isn't actually. uses different method
+postResample(pred = Doug.2012paper.predicted.FFOCISF.Total$predicted.FFOCISF.Total, 
+             obs = Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)
+RMSE(pred = Doug.2012paper.predicted.FFOCISF.Total$predicted.FFOCISF.Total, 
+     obs = Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)/sd(Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)
+## Option 2 (SPAN's imputation)
+postResample(pred = Doug.2012paper.rescored2.predicted.FFOCISF.Total$predicted.FFOCISF.Scaled.Total, 
+             obs = Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)
+RMSE(pred = Doug.2012paper.rescored2.predicted.FFOCISF.Total$predicted.FFOCISF.Scaled.Total, 
+             obs = Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)/sd(Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total)
+
+# Histograms
+## Option 1
+hist(Doug.2012paper.predicted.FFOCISF.Total$predicted.FFOCISF.Total, 
+     main = "Predicted Score - Doug's Imputation", xlab = "FFOCISF Total")
+hist(Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total,
+     main = "Actual Score - Doug's Imputation", xlab = "FFOCISF Total")
+## Option 2
+hist(Doug.2012paper.rescored2.predicted.FFOCISF.Total$predicted.FFOCISF.Scaled.Total, 
+     main = "Predicted Score - SPAN Imputation", xlab = "FFOCISF Scaled Total")
+hist(Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total, 
+     main = "Actual Score - SPAN Imputation", xlab = "FFOCISF Scaled Total")
+```
+
+## Residualized model/data
+Note: do not need to center + scale data before predicting. the predict function automatically applies preprocessing used in the model
+```{r predictions.residualized}
+# Generate predictions
+Doug.2012paper.predicted.res.FFOCISF.Total <- predict(final.SPAN.model.res, 
+                                                      Doug.2012paper.data.rescored_complete.FFOCI.scaled) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored_complete.FFOCI.scaled$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Total.Res", "FakeID"))
+Doug.2012paper.rescored2.predicted.res.FFOCISF.Total <- predict(final.SPAN.model.res, 
+                                                     Doug.2012paper.data.rescored2_complete.FFOCI.scaled) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored2_complete.FFOCI.scaled$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Scaled.Total.Res", "FakeID"))
+
+# Write predictions to file
+write.csv(Doug.2012paper.predicted.res.FFOCISF.Total, file = paste0(results.dir, "Doug2012paper.predicted.FFOCI.Total.res_FU12glmnet.model.csv"), row.names = FALSE)
+write.csv(Doug.2012paper.rescored2.predicted.res.FFOCISF.Total, file = paste0(results.dir, "Doug2012paper.rescored2.predicted.FFOCI.Scaled.Total.res_FU12glmnet.model.csv"), row.names = FALSE)
+
+# Get error metrics for predictions
+## Option 1 (Doug's imputation)
+postResample(pred = Doug.2012paper.predicted.res.FFOCISF.Total$predicted.FFOCISF.Total.Res, 
+             obs = Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res)[[1]]/
+sd(Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res)
+## Option 2 (SPAN imputation)
+postResample(pred = Doug.2012paper.rescored2.predicted.res.FFOCISF.Total$predicted.FFOCISF.Scaled.Total.Res, 
+             obs = Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res)[[1]]/
+    sd(Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res)
+
+# Histograms
+## Option 1
+hist(Doug.2012paper.data.rescored_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res, 
+     xlab = "FFOCISF Total Residualized", main = "Actual Score - Doug's Imputation")
+hist(Doug.2012paper.predicted.res.FFOCISF.Total, 
+     xlab = "FFOCISF Total Residualized", main = "Predicted Score - Doug's Imputation")
+## Option 2
+hist(Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res, 
+     xlab = "FFOCISF Scaled Total Residualized", main = "Actual Score - SPAN Imputation", xlim = c(-100,100))
+hist(Doug.2012paper.rescored2.predicted.res.FFOCISF.Total$predicted.FFOCISF.Scaled.Total.Res, 
+     xlab = "FFOCISF Scaled Total Residualized", main = "Predicted Score - SPAN Imputation")
+
+# Actual vs. predicted
+## Option 2 (SPAN imputation) + residualized
+plot(Doug.2012paper.data.rescored2_complete.FFOCI.scaled$FU12FFOCI_Scaled.Total.res, 
+     Doug.2012paper.rescored2.predicted.res.FFOCISF.Total$predicted.FFOCISF.Scaled.Total.Res, 
+     xlab= "Observed Residualized FFOCI-SF Scaled Total", 
+     ylab = "Predicted Residualized FFOCI-SF Scaled Total", 
+     xlim = c(-60,100), ylim = c(-60, 100), 
+     main = "Observed vs. Predicted\nFFOCI-SF Scaled Total (Residualized)",
+     abline =c(0,1))
+
+## Option 2 (SPAN imputation) + residualized (using saved files to generate this)
+# Load the data
+Doug.2012paper.rescored2.predicted.res.FFOCISF.Total <- read.csv(paste0("../", results.dir, "./predicted.scores/Doug2012paper.rescored2.predicted.FFOCI.Scaled.Total.res_FU12glmnet.model.csv"))
+# Open graphical device to save it
+pdf(file = paste0("../Figures/final.data/Doug.data_ObsvsPred.FFOCISF.res_FU12FFOCIglmnet.res.pdf"))
+# Graph
+plot(DOUG.FINAL.DATA$FU12FFOCI_Scaled.Total.res, 
+     Doug.2012paper.rescored2.predicted.res.FFOCISF.Total$predicted.FFOCISF.Scaled.Total.Res, 
+     xlab= "Observed Residualized FFOCI-SF Scaled Total", 
+     ylab = "Predicted Residualized FFOCI-SF Scaled Total", 
+     xlim = c(-60,100), ylim = c(-60, 100), 
+     main = "External Validation Dataset\nObserved vs. Predicted\nFFOCI-SF Scaled Total (Residualized)")
+     #asp = 1)
+abline(a=0, b=1) # adds x=y line to graph
+#     abline =c(0,1))
+# Close graphical device
+dev.off()
+```
+
+# Rerun w/o age outliers
+Remove the 46 + 71 year-olds in the dataset and see if affects results
+```{r age.outliers, eval=FALSE}
+# Remove those two subjects
+## Option 1 (Doug's imputation)
+Doug.2012paper.data.rescored_older.removed <- Doug.2012paper.data.rescored_complete.FFOCI.scaled %>% 
+    filter(!PFU12Age %in% c(46, 71))  # note if use regular filter syntax, will also remove rows w/NAs
+## Option 2 (SPAN's Imputation)
+Doug.2012paper.data.rescored2_older.removed <- Doug.2012paper.data.rescored2_complete.FFOCI.scaled %>% 
+    filter(!PFU12Age %in% c(46, 71))  # note if use regular filter syntax, will also remove rows w/NAs
+
+# Generate predictions using NON-residualized data/model
+## Option 1
+Doug.2012paper_older.removed_predicted.FFOCISF.Total <- predict(final.SPAN.model.NOT.res, 
+                                                        Doug.2012paper.data.rescored_older.removed) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored_older.removed$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Total", "FakeID"))
+## Option 2
+Doug.2012paper.rescored2_older.removed_predicted.FFOCISF.Total <- predict(final.SPAN.model.NOT.res, 
+                                                        Doug.2012paper.data.rescored2_older.removed) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored2_older.removed$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Scaled.Total", "FakeID"))
+
+## Create files of predicted scores
+write.csv(Doug.2012paper_older.removed_predicted.FFOCISF.Total, file = paste0(results.dir, "Doug2012paper_older.removed_predicted.FFOCI.Total_FU12glmnet.model.csv"), row.names = FALSE)
+write.csv(Doug.2012paper.rescored2_older.removed_predicted.FFOCISF.Total, file = paste0(results.dir, "Doug2012paper.rescored2_older.removed_predicted.FFOCI.ScaledTotal_FU12glmnet.model.csv"), row.names = FALSE)
+
+## Get error metrics for predictions
+## Option 1 (Doug's imputation)
+postResample(pred = Doug.2012paper_older.removed_predicted.FFOCISF.Total$predicted.FFOCISF.Total, 
+             obs = Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total)
+RMSE(pred = Doug.2012paper_older.removed_predicted.FFOCISF.Total$predicted.FFOCISF.Total, 
+     obs = Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total)/sd(Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total)
+## Option 2 (SPAN's imputation)
+postResample(pred = Doug.2012paper.rescored2_older.removed_predicted.FFOCISF.Total$predicted.FFOCISF.Scaled.Total,
+             obs = Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total)
+RMSE(pred = Doug.2012paper.rescored2_older.removed_predicted.FFOCISF.Total$predicted.FFOCISF.Scaled.Total,
+             obs = Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total)/sd(Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total)
+
+# Generate predictions using RESIDUALIZED data/model
+## Predictions
+## Option 1 (Doug's imputation)
+Doug.2012paper_older.removed_predicted.res.FFOCISF.Total <- predict(final.SPAN.model.res,                                                          Doug.2012paper.data.rescored_older.removed) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored_older.removed$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.Total.res", "Fake.ID"))
+## Option 2 (SPAN's imputation)
+Doug.2012paper.rescored2_older.removed_predicted.res.FFOCISF.ScaledTotal <- predict(final.SPAN.model.res,                                                           Doug.2012paper.data.rescored2_older.removed) %>%
+    as.data.frame() %>% bind_cols(., Doug.2012paper.data.rescored2_older.removed$PFU12Fake.ID) %>% 
+    setNames(., c("predicted.FFOCISF.ScaledTotal.res", "Fake.ID"))
+
+## Save predictions to files
+write.csv(Doug.2012paper_older.removed_predicted.res.FFOCISF.Total, file = paste0(results.dir, "Doug.2012paper_older.removed_predicted.res.FFOCISF.Total_FU12glmnet.model.csv"), row.names = FALSE)
+write.csv(Doug.2012paper.rescored2_older.removed_predicted.res.FFOCISF.ScaledTotal, file = paste0(results.dir,  "Doug.2012paper.rescored2_older.removed_predicted.res.FFOCISF.ScaledTotal_FU12glmnet.model.csv"), row.names = FALSE)
+
+## Get error metrics for predictions
+## Option 1 (Doug's imputation)
+postResample(pred = Doug.2012paper_older.removed_predicted.res.FFOCISF.Total$predicted.FFOCISF.Total.res, 
+             obs = Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total.res)
+RMSE(pred = Doug.2012paper_older.removed_predicted.res.FFOCISF.Total$predicted.FFOCISF.Total.res, 
+             obs = Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total.res)/sd(Doug.2012paper.data.rescored_older.removed$FU12FFOCI_Scaled.Total.res)
+## Option 2 (SPAN's imputation)
+postResample(pred = Doug.2012paper.rescored2_older.removed_predicted.res.FFOCISF.ScaledTotal$predicted.FFOCISF.ScaledTotal.res,
+             obs = Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total.res)
+RMSE(pred = Doug.2012paper.rescored2_older.removed_predicted.res.FFOCISF.ScaledTotal$predicted.FFOCISF.ScaledTotal.res,
+             obs = Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total.res)/sd(Doug.2012paper.data.rescored2_older.removed$FU12FFOCI_Scaled.Total.res)
+```
+Conclusion: results only changed very slightly (RMSE was actually slightly bigger when removed these outliers) 
+
+# Wrap-up
+```{r wrapup}
+# Remove PFU12 from variable names once done (since bogus variable names used to match SPAN model variable names)
+
+lapply(c(Doug.2012paper.data.rescored, Doug.2012paper.data.rescored_complete.FFOCI.scaled, Doug.2012paper.data.rescored2, Doug.2012paper.data.rescored2_complete.FFOCI.scaled, Doug.2012paper.data.rescored_older.removed, Doug.2012paper.data.rescored2_older.removed), function(df) colnames(df) <- gsub("PFU12", "", colnames(df)))
+
+colnames(Doug.2012paper.data.rescored) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored))
+colnames(Doug.2012paper.data.rescored2) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored2))
+colnames(Doug.2012paper.data.rescored_complete.FFOCI.scaled) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored_complete.FFOCI.scaled))
+colnames(Doug.2012paper.data.rescored2_complete.FFOCI.scaled) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored2_complete.FFOCI.scaled))
+colnames(Doug.2012paper.data.rescored_older.removed) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored_older.removed))
+colnames(Doug.2012paper.data.rescored2_older.removed) <- gsub("PFU12", "", colnames(Doug.2012paper.data.rescored2_older.removed))
+```
+
+# Tables
+```{r}
+library(arsenal)
+
+# Customize the stats to display
+my_table_controls <- tableby.control(
+  test = F,
+  total = T,
+  cat.simplify = T,
+  numeric.simplify = T,
+  numeric.stats = c("meansd"),
+  cat.stats = c("countpct"),
+  digits = 2)
+
+demog_table <- tableby(~ Age + Gender + Ethnicity + Hispanic,                    
+                           data = Doug.2012paper.data.rescored_complete.FFOCI.scaled,
+                           control = my_table_controls)
+
+summary(demog_table, 
+#        labelTranslations = my_table_labels, 
+        digits = 2,
+        title = "Table 2")
+```
